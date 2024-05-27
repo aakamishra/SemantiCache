@@ -21,6 +21,158 @@ from datetime import datetime
 import time
 
 
+class SemanticCache(nn.Module):
+    def __init__(self, cache_size=128, similarity_type='cosine', similarity_threshold=0.9):
+        super(SemanticCache, self).__init__()
+        self.cache_size = cache_size
+        self.similarity_type = similarity_type
+        self.similarity_threshold = similarity_threshold
+        self.similarity_function = nn.CosineSimilarity(dim=1, eps=1e-6)
+        self.cache_embeddings = []
+        self.cache_values = []
+
+    def add_to_cache(self, embedding, value):
+        if len(self.cache_embeddings) >= self.cache_size:
+            # Evict the oldest item (FIFO)
+            self.cache_embeddings.pop(0)
+            self.cache_values.pop(0)
+        self.cache_embeddings.append(embedding)
+        self.cache_values.append(value)
+    
+    def get_similarity(self, embedding):
+        if not self.cache_embeddings:
+            return None, None
+        
+        # Stack cached embeddings to form a tensor
+        cache_embeddings_tensor = torch.stack(self.cache_embeddings)
+        # Compute similarity between the new embedding and all cached embeddings
+        similarities = self.similarity_function(cache_embeddings_tensor, embedding.unsqueeze(0))
+        
+        # Find the maximum similarity and its index
+        max_similarity, max_index = similarities.max(dim=0)
+        return max_similarity.item(), max_index.item()
+    
+    def get_from_cache(self, embedding):
+        max_similarity, max_index = self.get_similarity(embedding)
+        
+        if max_similarity is not None and max_similarity > self.similarity_threshold:
+            embedding_hit = self.cache_embeddings.pop(max_index)
+            value_hit = self.cache_values.pop(max_index)
+            self.cache_embeddings.append(embedding_hit)
+            self.cache_values.append(value_hit)
+            return value_hit
+        return None
+    
+    def forward(self, embedding):
+        # Check cache first
+        cached_value = self.get_from_cache(embedding)
+        
+        if cached_value is not None:
+            return cached_value  # Return the cached value if there's a hit
+    
+        return None
+
+
+
+class LightEncodingClassificationModel(nn.Module):
+    def __init__(self, config, model_name, hidden_dim, num_classes, cache_size=128, similarity_type='cosine', similarity_threshold=0.9):
+        super().__init__()
+        self.config = config
+        self.semantic_cache = SemanticCache(cache_size, similarity_type, similarity_threshold)
+        self.bert = BertModel.from_pretrained(model_name)
+        # Fix the weights of the pretrained model
+        if not FLAG_BERT_TUNING:
+            for param in self.bert.parameters():
+                param.requires_grad = False
+
+        # The output layer that takes the [CLS] representation and gives an output
+        self.cls = nn.Linear(config.hidden_size, hidden_dim)
+        self.relu = nn.ReLU()
+        if FLAG_VICUNA_DATA_ONLY:
+            self.fc1 = nn.Linear(hidden_dim, hidden_dim)
+        else:
+            self.fc1 = nn.Linear(hidden_dim + num_models, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, num_classes)
+        self.logsoftmax = nn.LogSoftmax(dim=-1)
+
+    def forward(self, input_ids, attention_mask, model_name=None):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        # Obtain the representations of [CLS] heads
+        # outputs.last_hidden_state: [batch_size, sequence_size, hidden_size]
+        logits = outputs.last_hidden_state[:,0,:]
+
+        if not self.training:
+            cache_hit = self.semantic_cache(logits)
+            if cache_hit is None:
+                output = self.relu(self.cls(logits))
+                if FLAG_VICUNA_DATA_ONLY:
+                    output = self.relu(self.fc1(output))
+                else:
+                    output = self.relu(self.fc1(torch.cat((output, model_name), dim=-1)))
+                output = self.logsoftmax(self.fc2(output))
+                self.semantic_cache.add_to_cache(logits, output)
+                return output
+            else:
+                return cache_hit
+        else:
+            output = self.relu(self.cls(logits))
+            if FLAG_VICUNA_DATA_ONLY:
+                output = self.relu(self.fc1(output))
+            else:
+                output = self.relu(self.fc1(torch.cat((output, model_name), dim=-1)))
+            output = self.logsoftmax(self.fc2(output))
+            return output
+
+
+class LightEncodingRegressionModel(nn.Module):
+    def __init__(self, config, model_name, hidden_dim,  cache_size=128, similarity_type='cosine', similarity_threshold=0.9):
+        super().__init__()
+        self.config = config
+        self.semantic_cache = SemanticCache(cache_size, similarity_type, similarity_threshold)
+        self.bert = BertModel.from_pretrained(model_name)
+        # Fix the weights of the pretrained model
+        if not FLAG_BERT_TUNING:
+            for param in self.bert.parameters():
+                param.requires_grad = False
+
+        # The output layer that takes the [CLS] representation and gives an output
+        self.cls = nn.Linear(config.hidden_size, hidden_dim)
+        self.relu = nn.ReLU()
+        if FLAG_VICUNA_DATA_ONLY:
+            self.fc1 = nn.Linear(hidden_dim, hidden_dim)
+        else:
+            self.fc1 = nn.Linear(hidden_dim + num_models, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 1)
+
+    def forward(self, input_ids, attention_mask, model_name=None):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        # Obtain the representations of [CLS] heads
+        # outputs.last_hidden_state: [batch_size, sequence_size, hidden_size]
+        logits = outputs.last_hidden_state[:,0,:]
+
+        if not self.training:
+            cache_hit = self.semantic_cache(logits)
+            if cache_hit is None:
+                output = self.relu(self.cls(logits))
+                if FLAG_VICUNA_DATA_ONLY:
+                    output = self.relu(self.fc1(output))
+                else:
+                    output = self.relu(self.fc1(torch.cat((output, model_name), dim=-1)))
+                output = self.fc2(output).squeeze(-1)
+                self.semantic_cache.add_to_cache(logits, output)
+                return output
+            else:
+                return cache_hit
+        else:
+            output = self.relu(self.cls(logits))
+            if FLAG_VICUNA_DATA_ONLY:
+                output = self.relu(self.fc1(output))
+            else:
+                output = self.relu(self.fc1(torch.cat((output, model_name), dim=-1)))
+            output = self.fc2(output).squeeze(-1)
+            return output
+
+
 class BertClassificationModel(nn.Module):
     def __init__(self, config, model_name, hidden_dim, num_classes):
         super().__init__()
