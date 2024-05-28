@@ -312,7 +312,8 @@ def train(model, criterion, optimizer, train_dataloader, validation_dataloader, 
     if FLAG_WRITE_RESULTS:
         writer = SummaryWriter()
 
-    for epoch in tqdm(range(num_epochs)):
+    for epoch in range(num_epochs):
+        print(f"Starting Epoch: {epoch} / {num_epochs}")
         training_loss = 0
         model.train()
         # Fix the BERT weights after 3 training epochs
@@ -322,7 +323,7 @@ def train(model, criterion, optimizer, train_dataloader, validation_dataloader, 
             for param_group in optimizer.param_groups:
                 param_group['lr'] = 1e-4
 
-        for batch in train_dataloader:
+        for batch in tqdm(train_dataloader):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             if FLAG_VICUNA_DATA_ONLY:
@@ -595,6 +596,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_name', type=str, help='Name of the LLM to predict for', default='vicuna-13b')
     parser.add_argument('--customized', action='store_true', help='Whether to use customized dataset', default=False)
     parser.add_argument('--dataset_path', type=str, help='Path to customized dataset', default='data/customized_1K')
+    parser.add_argument('--semanticache', action='store_true', default=False)
     args = parser.parse_args()
 
     # 0: regression; 1: binary classification; 2: multi-class classification; 
@@ -604,6 +606,7 @@ if __name__ == '__main__':
     FLAG_VICUNA_DATA_ONLY = not args.all_models
     FLAG_FIRST_ROUND_ONLY = not args.multi_round
     FLAG_HEAD_TAIL = args.head_tail
+    FLAG_SEMANTICACHE = args.semanticache
 
     FLAG_LOAD_MODEL_WEIGHTS = False
     FLAG_SAVE_MODEL_WEIGHTS = True
@@ -623,7 +626,7 @@ if __name__ == '__main__':
                    'claude-2', 'gpt4all-13b-snoozy']
     num_models = len(model_names)
 
-    model_name = 'prajjwal1/bert-tiny' if FLAG_TINY_BERT else 'bert-base-uncased'
+    model_name = 'prajjwal1/bert-tiny' if (FLAG_TINY_BERT or FLAG_SEMANTICACHE) else 'bert-base-uncased'
 
     num_classes = 3 if (TASK_TYPE == 1 or TASK_TYPE == 4) else 5
     vicuna_tokenizer = AutoTokenizer.from_pretrained("lmsys/vicuna-13b-v1.3", legacy=False)
@@ -657,14 +660,22 @@ if __name__ == '__main__':
 
     # regression or ordinal classification
     if TASK_TYPE == 0 or TASK_TYPE == 3 or TASK_TYPE == 4:
-        model = BertRegressionModel(config, model_name, hidden_dim=128).to(device)
+        if FLAG_SEMANTICACHE:
+            print("Loading light encoding model . . .")
+            model = LightEncodingRegressionModel(config, model_name, hidden_dim=128).to(device)
+        else:
+            model = BertRegressionModel(config, model_name, hidden_dim=128).to(device)
         if FLAG_L1_LOSS:
             criterion = nn.L1Loss()
         else:
             criterion = nn.MSELoss()
     # classification
     elif TASK_TYPE == 1 or TASK_TYPE == 2:
-        model = BertClassificationModel(config, model_name, hidden_dim=128, num_classes=num_classes).to(device)
+        if FLAG_SEMANTICACHE:
+            print("Loading light encoding model . . .")
+            model = LightEncodingClassificationModel(config, model_name, hidden_dim=128).to(device)
+        else:
+            model = BertClassificationModel(config, model_name, hidden_dim=128, num_classes=num_classes).to(device)
         # criterion = nn.NLLLoss()
         criterion = nn.NLLLoss(weight=torch.tensor(weights).to(device))
     optimizer = torch.optim.AdamW(params=model.parameters(), lr=lr)
