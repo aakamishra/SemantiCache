@@ -35,15 +35,15 @@ def get_actual_label_new_div(x, num_classes):
 
 
 def gen_prediction_heatmap():
-    num_classes = 2
-    df = pd.read_csv('results/predictions_warmup_cls_1000K.csv')
+    num_classes = 5
+    df = pd.read_csv('results/predictions_all_models_warmup_reg_l1_10K.csv')
 
     actual_len = df['actual_length'].to_numpy()
     prediction = df['predicted_label'].to_numpy()
 
     count = [[0 for _ in range(num_classes)] for __ in range(num_classes)]
     for i in range(len(actual_len)):
-        actual_len[i] = get_actual_label(actual_len[i], num_classes)
+        actual_len[i] = get_actual_label_new_div(actual_len[i], num_classes)
         count[actual_len[i]][prediction[i]] += 1
 
     Index= [f'actual_{i}' for i in range(num_classes)]
@@ -81,4 +81,15 @@ def calc_accuracy_vs_round():
 
 
 if __name__ == '__main__':
-    calc_accuracy_vs_round()
+    num_classes = 5
+    df = pd.read_csv('results/predictions_all_models_warmup_reg_l1_10K.csv')
+
+    actual_label = df['actual_length'].tolist()
+    predicted_label = df['predicted_label'].tolist()
+    for sample_i in range(len(predicted_label)):
+        predicted_label[sample_i] = get_actual_label_new_div(predicted_label[sample_i], num_classes)
+        actual_label[sample_i] = get_actual_label_new_div(actual_label[sample_i], num_classes)
+    print(f'Overall: ')
+    accuracy = accuracy_score(actual_label, predicted_label)
+    f1 = f1_score(actual_label, predicted_label, average='weighted')
+    print(f'Accuracy: {accuracy}, F1 score: {f1}')

@@ -19,25 +19,27 @@ import os
 import numpy as np
 from datetime import datetime
 import time
+import pdb
 
 
 class SemanticCache(nn.Module):
-    def __init__(self, cache_size=128, similarity_type='cosine', similarity_threshold=0.9):
+    def __init__(self, cache_size=128, similarity_type='cosine', similarity_threshold=0.99):
         super(SemanticCache, self).__init__()
         self.cache_size = cache_size
         self.similarity_type = similarity_type
         self.similarity_threshold = similarity_threshold
-        self.similarity_function = nn.CosineSimilarity(dim=1, eps=1e-6)
+        self.similarity_function = nn.CosineSimilarity(eps=1e-6)
         self.cache_embeddings = []
         self.cache_values = []
 
-    def add_to_cache(self, embedding, value):
+    def add_to_cache(self, embeddings, values):
         if len(self.cache_embeddings) >= self.cache_size:
             # Evict the oldest item (FIFO)
             self.cache_embeddings.pop(0)
             self.cache_values.pop(0)
-        self.cache_embeddings.append(embedding)
-        self.cache_values.append(value)
+        for i in range(len(embeddings)):
+            self.cache_embeddings.append(embeddings[i])
+            self.cache_values.append(values[i])
     
     def get_similarity(self, embedding):
         if not self.cache_embeddings:
@@ -49,13 +51,15 @@ class SemanticCache(nn.Module):
         similarities = self.similarity_function(cache_embeddings_tensor, embedding.unsqueeze(0))
         
         # Find the maximum similarity and its index
-        max_similarity, max_index = similarities.max(dim=0)
+        max_index = similarities.argmax()
+        max_similarity = similarities[max_index]
         return max_similarity.item(), max_index.item()
     
     def get_from_cache(self, embedding):
         max_similarity, max_index = self.get_similarity(embedding)
         
         if max_similarity is not None and max_similarity > self.similarity_threshold:
+            #pdb.set_trace()
             embedding_hit = self.cache_embeddings.pop(max_index)
             value_hit = self.cache_values.pop(max_index)
             self.cache_embeddings.append(embedding_hit)
@@ -63,19 +67,21 @@ class SemanticCache(nn.Module):
             return value_hit
         return None
     
-    def forward(self, embedding):
+    def forward(self, embeddings):
         # Check cache first
-        cached_value = self.get_from_cache(embedding)
-        
-        if cached_value is not None:
-            return cached_value  # Return the cached value if there's a hit
-    
-        return None
+        cache_return = []
+        for i, embedding in enumerate(embeddings):
+            cached_value = self.get_from_cache(embedding)
+            if cache_return is None:
+                cached_value = float('nan')
+            cache_return.append(cached_value)
+        #pdb.set_trace()
+        return cache_return
 
 
 
 class LightEncodingClassificationModel(nn.Module):
-    def __init__(self, config, model_name, hidden_dim, num_classes, cache_size=128, similarity_type='cosine', similarity_threshold=0.9):
+    def __init__(self, config, model_name, hidden_dim, num_classes, cache_size=128, similarity_type='cosine', similarity_threshold=0.99):
         super().__init__()
         self.config = config
         self.semantic_cache = SemanticCache(cache_size, similarity_type, similarity_threshold)
@@ -95,25 +101,27 @@ class LightEncodingClassificationModel(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, num_classes)
         self.logsoftmax = nn.LogSoftmax(dim=-1)
 
-    def forward(self, input_ids, attention_mask, model_name=None):
+    def forward(self, input_ids, attention_mask, model_name=None, cache_off=False):
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         # Obtain the representations of [CLS] heads
         # outputs.last_hidden_state: [batch_size, sequence_size, hidden_size]
         logits = outputs.last_hidden_state[:,0,:]
 
-        if not self.training:
-            cache_hit = self.semantic_cache(logits)
-            if cache_hit is None:
-                output = self.relu(self.cls(logits))
-                if FLAG_VICUNA_DATA_ONLY:
-                    output = self.relu(self.fc1(output))
-                else:
-                    output = self.relu(self.fc1(torch.cat((output, model_name), dim=-1)))
-                output = self.logsoftmax(self.fc2(output))
-                self.semantic_cache.add_to_cache(logits, output)
-                return output
+        if not self.training or not cache_off:
+            encoding = logits
+            cache_hits = self.semantic_cache(encoding)
+            output = self.relu(self.cls(logits))
+            if FLAG_VICUNA_DATA_ONLY:
+                output = self.relu(self.fc1(output))
             else:
-                return cache_hit
+                output = self.relu(self.fc1(torch.cat((output, model_name), dim=-1)))
+            output = self.logsoftmax(self.fc2(output))
+            for i, cache_hit in enumerate(cache_hits):
+                if cache_hit != None:
+                    output[i] = cache_hit
+                else:
+                    self.semantic_cache.add_to_cache([encoding[i]], [output[i].item()])
+            return output
         else:
             output = self.relu(self.cls(logits))
             if FLAG_VICUNA_DATA_ONLY:
@@ -144,25 +152,27 @@ class LightEncodingRegressionModel(nn.Module):
             self.fc1 = nn.Linear(hidden_dim + num_models, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, 1)
 
-    def forward(self, input_ids, attention_mask, model_name=None):
+    def forward(self, input_ids, attention_mask, model_name=None, cache_off=True):
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         # Obtain the representations of [CLS] heads
         # outputs.last_hidden_state: [batch_size, sequence_size, hidden_size]
         logits = outputs.last_hidden_state[:,0,:]
 
-        if not self.training:
-            cache_hit = self.semantic_cache(logits)
-            if cache_hit is None:
-                output = self.relu(self.cls(logits))
-                if FLAG_VICUNA_DATA_ONLY:
-                    output = self.relu(self.fc1(output))
-                else:
-                    output = self.relu(self.fc1(torch.cat((output, model_name), dim=-1)))
-                output = self.fc2(output).squeeze(-1)
-                self.semantic_cache.add_to_cache(logits, output)
-                return output
+        if not self.training or not cache_off:
+            encoding = logits
+            cache_hits = self.semantic_cache(encoding)
+            output = self.relu(self.cls(logits))
+            if FLAG_VICUNA_DATA_ONLY:
+                output = self.relu(self.fc1(output))
             else:
-                return cache_hit
+                output = self.relu(self.fc1(torch.cat((output, model_name), dim=-1)))
+            output = self.fc2(output).squeeze(-1)
+            for i, cache_hit in enumerate(cache_hits):
+                if cache_hit != None:
+                    output[i] = cache_hit
+                else:
+                    self.semantic_cache.add_to_cache([encoding[i]], [output[i].item()])
+            return output
         else:
             output = self.relu(self.cls(logits))
             if FLAG_VICUNA_DATA_ONLY:
@@ -353,7 +363,7 @@ def train(model, criterion, optimizer, train_dataloader, validation_dataloader, 
         training_loss_list.append(training_loss / len(train_dataloader))
         if epoch % 1 == 0:
             if TASK_TYPE == 0:
-                validation_metrics = eval_regression(model, validation_dataloader, device)
+                validation_metrics = eval_regression(model, validation_dataloader, device, cache_off=True)
             elif TASK_TYPE == 3 or TASK_TYPE == 4:
                 validation_metrics = eval_regression(model, validation_dataloader, device)
                 validation_metrics = validation_metrics | eval_classification(model, validation_dataloader, device)
@@ -406,7 +416,7 @@ def eval_classification(model, dataloader, device):
     return metric
 
 
-def eval_regression(model, dataloader, device):
+def eval_regression(model, dataloader, device, cache_off=True):
     l1loss = nn.L1Loss()
     mseloss = nn.MSELoss()
     model.eval()
@@ -418,10 +428,17 @@ def eval_regression(model, dataloader, device):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             if FLAG_VICUNA_DATA_ONLY:
-                prediction = model(input_ids=input_ids, attention_mask=attention_mask)
+                if not FLAG_SEMANTICACHE:
+                    prediction = model(input_ids=input_ids, attention_mask=attention_mask)
+                else:
+                    prediction = model(input_ids=input_ids, attention_mask=attention_mask, cache_off=cache_off)
+
             else:
                 model_name = batch['model'].to(device)
-                prediction = model(input_ids=input_ids, attention_mask=attention_mask, model_name=model_name)
+                if not FLAG_SEMANTICACHE:
+                    prediction = model(input_ids=input_ids, attention_mask=attention_mask, model_name=model_name)
+                else:
+                    prediction = model(input_ids=input_ids, attention_mask=attention_mask, cache_off=cache_off, model_name=model_name)
             if TASK_TYPE == 0:
                 labels = batch['num_tokens'].to(device)
             else:
@@ -461,7 +478,10 @@ def eval_all_models(model, testset, device):
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
                 model_name = batch['model'].to(device)
-                output = model(input_ids=input_ids, attention_mask=attention_mask, model_name=model_name)
+                if FLAG_SEMANTICACHE:
+                    output = model(input_ids=input_ids, attention_mask=attention_mask, model_name=model_name, cache_off=False)
+                else:
+                    output = model(input_ids=input_ids, attention_mask=attention_mask, model_name=model_name)
                 label = batch['labels'].to(device)
 
                 if TASK_TYPE != 3 and TASK_TYPE != 4:
@@ -526,6 +546,7 @@ def predict(model, dataloader, device):
                     print_model_names.append(model_names[model_ids[sample_i]])
 
     if FLAG_FIRST_ROUND_ONLY:
+        pdb.set_trace()
         df = pd.DataFrame({'actual_length': actual_lengths, 'predicted_label': predicted_labels, 'latency': latencies, 'model_name': print_model_names})
     else:
         df = pd.DataFrame({'actual_length': actual_lengths, 'predicted_label': predicted_labels, 'latency': latencies, 'turn_id': turn_ids, 'model_name': print_model_names})
@@ -626,7 +647,7 @@ if __name__ == '__main__':
                    'claude-2', 'gpt4all-13b-snoozy']
     num_models = len(model_names)
 
-    model_name = 'prajjwal1/bert-tiny' if (FLAG_TINY_BERT or FLAG_SEMANTICACHE) else 'bert-base-uncased'
+    model_name = 'prajjwal1/bert-tiny' if FLAG_TINY_BERT else 'bert-base-uncased'
 
     num_classes = 3 if (TASK_TYPE == 1 or TASK_TYPE == 4) else 5
     vicuna_tokenizer = AutoTokenizer.from_pretrained("lmsys/vicuna-13b-v1.3", legacy=False)
@@ -640,7 +661,7 @@ if __name__ == '__main__':
         dataset_path = args.dataset_path
 
     num_epochs = 6
-    train_batch_size = 16
+    train_batch_size = 8
     test_batch_size = 1
     lr = 1e-5 if FLAG_BERT_TUNING else 1e-4
 
